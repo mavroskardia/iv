@@ -22,8 +22,10 @@ struct ImageViewer {
     image_loading_tx: Sender<(usize, PathBuf)>,
     image_loading_rx: Receiver<(usize, DynamicImage)>,
     favorites_dir: PathBuf,
+    deleted_dir: PathBuf,
     favorite_counter: usize,
     flash_state: f32, // 0.0 to 1.0, where 1.0 is full flash
+    flash_color: egui::Color32, // Color of the flash effect
     state_file: PathBuf,
     current_directory: String,
 }
@@ -62,14 +64,17 @@ impl ImageViewer {
             }
         });
 
-        // Create favorites directory
-        let favorites_dir = std::env::current_exe()?
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("Could not get executable directory"))?
-            .join("favorites");
-        fs::create_dir_all(&favorites_dir)?;
+        // Create favorites and deleted directories
+        let exe_path = std::env::current_exe()?;
+        let exe_dir = exe_path.parent()
+            .ok_or_else(|| anyhow::anyhow!("Could not get executable directory"))?;
+        let favorites_dir = exe_dir.join("favorites");
+        let deleted_dir = exe_dir.join("deleted");
 
-        let state_file = favorites_dir.parent().unwrap().join("app_state.json");
+        fs::create_dir_all(&favorites_dir)?;
+        fs::create_dir_all(&deleted_dir)?;
+
+        let state_file = exe_dir.join("app_state.json");
         let current_directory = directory.to_string_lossy().to_string();
 
         // Load last position if available
@@ -112,8 +117,10 @@ impl ImageViewer {
             image_loading_tx: tx,
             image_loading_rx: loading_rx,
             favorites_dir,
+            deleted_dir,
             favorite_counter,
             flash_state: 0.0,
+            flash_color: egui::Color32::WHITE, // Default flash color
             state_file,
             current_directory,
         };
@@ -224,6 +231,47 @@ impl ImageViewer {
         fs::copy(current_image, &target_path)?;
         self.favorite_counter += 1;
 
+        self.flash_state = 1.0;
+        self.flash_color = egui::Color32::WHITE;
+
+        Ok(())
+    }
+
+    fn move_to_deleted(&mut self) -> Result<()> {
+        if self.images.is_empty() {
+            return Ok(());
+        }
+
+        let current_image = &self.images[self.current_index];
+        let filename = current_image
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("No filename found"))?;
+
+        let target_path = self.deleted_dir.join(filename);
+
+        // Use copy + delete instead of rename to work across drives
+        fs::copy(current_image, &target_path)?;
+        fs::remove_file(current_image)?;
+
+        // Remove the image from our list
+        self.images.remove(self.current_index);
+
+        // Adjust the loaded images
+        self.loaded_images = vec![None; 5];
+        self.image_textures = vec![None; 5];
+
+        // If we've deleted the last image, go to the previous one
+        if self.current_index >= self.images.len() && !self.images.is_empty() {
+            self.current_index = self.images.len() - 1;
+        }
+
+        // Set flash state to red
+        self.flash_state = 1.0;
+        self.flash_color = egui::Color32::RED;
+
+        // Reload images around the current index
+        self.load_initial_images()?;
+
         Ok(())
     }
 
@@ -269,8 +317,12 @@ impl eframe::App for ImageViewer {
         if ctx.input(|i| i.key_pressed(egui::Key::Plus)) {
             if let Err(e) = self.copy_to_favorites() {
                 eprintln!("Failed to copy image to favorites: {}", e);
-            } else {
-                self.flash_state = 1.0; // Start flash animation
+            }
+            ctx.request_repaint();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+            if let Err(e) = self.move_to_deleted() {
+                eprintln!("Failed to move image to deleted folder: {}", e);
             }
             ctx.request_repaint();
         }
@@ -311,10 +363,16 @@ impl eframe::App for ImageViewer {
                     // Draw flash overlay if active
                     if self.flash_state > 0.0 {
                         let rect = response.rect;
+                        let alpha = (self.flash_state * 0.5 * 255.0) as u8;
+                        let flash_color = match self.flash_color {
+                            egui::Color32::WHITE => egui::Color32::from_white_alpha(alpha),
+                            egui::Color32::RED => egui::Color32::from_rgba_premultiplied(255, 0, 0, alpha),
+                            _ => egui::Color32::from_white_alpha(alpha),
+                        };
                         ui.painter().rect_filled(
                             rect,
                             0.0,
-                            egui::Color32::from_white_alpha((self.flash_state * 0.5 * 255.0) as u8),
+                            flash_color,
                         );
                     }
 

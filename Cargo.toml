@@ -4,9 +4,32 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eframe = "0.26.0"
-image = "0.24.7"
-walkdir = "2.4.0"
-anyhow = "1.0.75"
+anyhow = "1.0"
+eframe = "0.29"
+image = "0.25"
+walkdir = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+ndarray = { version = "0.16", features = ["serde"] }
+ndarray-rand = "0.15"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+
+# Optional GPU acceleration with Candle
+# Note: CUDA support is disabled for Windows GNU target due to linking issues
+candle-core = { version = "0.8", optional = true }
+candle-nn = { version = "0.8", optional = true }
+
+[features]
+default = []
+gpu = ["candle-core", "candle-nn"]
+# CUDA feature - only enable CUDA backend on compatible platforms
+cuda = ["gpu", "candle-core/cuda", "candle-nn/cuda"]
+# Windows GNU compatible GPU (CPU fallback with GPU interface)
+gpu-windows-gnu = ["gpu"]
+
+[target.'cfg(all(target_os = "windows", target_env = "gnu"))'.dependencies]
+# For Windows GNU, use CPU-only candle to avoid CUDA linking issues
+candle-core = { version = "0.8", optional = true, default-features = false }
+candle-nn = { version = "0.8", optional = true, default-features = false }

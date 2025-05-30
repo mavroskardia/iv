@@ -290,7 +290,16 @@ impl ImageViewer {
 }
 
 impl eframe::App for ImageViewer {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Update window title with current filename
+        if let Some(current_path) = self.images.get(self.current_index) {
+            if let Some(filename) = current_path.file_name() {
+                if let Some(filename_str) = filename.to_str() {
+                    ctx.send_viewport_cmd(ViewportCommand::Title(format!("{} | IV", filename_str)));
+                }
+            }
+        }
+
         self.update_loaded_images();
 
         // Update flash animation

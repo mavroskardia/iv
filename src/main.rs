@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use anyhow::Result;
 use eframe::egui::{self, ViewportBuilder, ViewportCommand};
 use image::DynamicImage;
@@ -9,17 +11,152 @@ use walkdir::WalkDir;
 use std::fs;
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Array4, CowArray};
 use ndarray_rand::RandomExt;
 use ndarray_rand::rand_distr::Uniform;
 use sha2::{Sha256, Digest};
 use hex;
 use rand::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+use eframe::epaint::CornerRadius;
+use rand::rng;
+use ort::{Environment, SessionBuilder, Value};
 
 #[cfg(feature = "gpu")]
 use candle_core::{Device as CandleDevice, Tensor as CandleTensor, DType};
 #[cfg(feature = "gpu")]
 use candle_nn::{Linear, Module, VarBuilder, VarMap, Optimizer, AdamW, ParamsAdamW};
+
+// Function to find model file relative to executable
+fn find_model_path() -> Result<PathBuf> {
+    // First try relative to current directory (for cargo run)
+    let current_dir_model = PathBuf::from("models/resnet50-v1-7-compatible.onnx");
+    if current_dir_model.exists() {
+        return Ok(current_dir_model);
+    }
+
+    // Then try relative to executable (for packaged version)
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let exe_dir_model = exe_dir.join("models/resnet50-v1-7-compatible.onnx");
+            if exe_dir_model.exists() {
+                return Ok(exe_dir_model);
+            }
+
+            // Try one level up from executable (common packaging structure)
+            let parent_dir_model = exe_dir.parent()
+                .map(|p| p.join("models/resnet50-v1-7-compatible.onnx"));
+            if let Some(ref path) = parent_dir_model {
+                if path.exists() {
+                    return Ok(path.clone());
+                }
+            }
+        }
+    }
+
+    anyhow::bail!("Could not find model file 'resnet50-v1-7-compatible.onnx'. Please ensure it exists in:\n\
+                   - ./models/ (relative to current directory)\n\
+                   - <executable_dir>/models/\n\
+                   - <executable_parent_dir>/models/")
+}
+
+// Static flag to ensure GPU initialization message is only printed once
+#[allow(dead_code)]
+static GPU_MESSAGE_PRINTED: AtomicBool = AtomicBool::new(false);
+
+// Image processing thread communication types
+#[derive(Clone)]
+#[allow(dead_code)]
+enum ImageProcessingRequest {
+    LoadImage { index: usize, path: PathBuf },
+    #[allow(dead_code)]
+    PrepareTexture { index: usize, image: DynamicImage, display_size: (u32, u32) },
+    ExtractFeatures { hash: String, image: DynamicImage },
+    #[allow(dead_code)]
+    ComputeHash { index: usize, image: DynamicImage },
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+enum ImageProcessingResponse {
+    ImageLoaded { index: usize, image: DynamicImage },
+    #[allow(dead_code)]
+    TexturePrepared { index: usize, rgba_data: Vec<u8>, width: usize, height: usize },
+    FeaturesExtracted { hash: String, features: Vec<f32> },
+    #[allow(dead_code)]
+    HashComputed { index: usize, hash: String },
+}
+
+// GPU-optimized image processing
+struct OptimizedImage {
+    original: DynamicImage,
+    display_texture: Option<egui::TextureHandle>,
+    display_size: (u32, u32),
+    needs_resize: bool,
+}
+
+impl OptimizedImage {
+    fn new(image: DynamicImage) -> Self {
+        // Pre-calculate if we need to resize for performance
+        let (w, h) = (image.width(), image.height());
+        let needs_resize = w > 2048 || h > 2048; // Resize images larger than 2K for better performance
+
+        Self {
+            display_size: if needs_resize {
+                // Calculate optimal display size maintaining aspect ratio
+                let max_dim = 2048.0;
+                let aspect = w as f32 / h as f32;
+                if w > h {
+                    ((max_dim as u32), (max_dim / aspect) as u32)
+                } else {
+                    ((max_dim * aspect) as u32, max_dim as u32)
+                }
+            } else {
+                (w, h)
+            },
+            original: image,
+            display_texture: None,
+            needs_resize,
+        }
+    }
+
+    fn get_display_image(&self) -> DynamicImage {
+        if self.needs_resize {
+            self.original.resize(
+                self.display_size.0,
+                self.display_size.1,
+                image::imageops::FilterType::Lanczos3, // High quality resizing
+            )
+        } else {
+            self.original.clone()
+        }
+    }
+
+    fn create_optimized_texture(&mut self, ctx: &egui::Context, key: String) -> &egui::TextureHandle {
+        if self.display_texture.is_none() {
+            let display_img = self.get_display_image();
+            let rgba_data = display_img.to_rgba8();
+
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [display_img.width() as usize, display_img.height() as usize],
+                &rgba_data.into_raw(),
+            );
+
+            // Use simpler texture options during heavy usage to reduce GPU load
+            let texture_options = egui::TextureOptions {
+                magnification: egui::TextureFilter::Nearest, // Faster than Linear during window movement
+                minification: egui::TextureFilter::Linear,
+                wrap_mode: egui::TextureWrapMode::ClampToEdge,
+                mipmap_mode: None,
+            };
+
+            self.display_texture = Some(ctx.load_texture(key, color_image, texture_options));
+        }
+
+        self.display_texture.as_ref().unwrap()
+    }
+}
 
 #[derive(Serialize, Deserialize, Default)]
 struct AppState {
@@ -33,9 +170,143 @@ struct ImageRating {
     features: Vec<f32>,
 }
 
+// Animation system for smooth effects
+#[derive(Clone)]
+struct FlashAnimation {
+    start_time: Instant,
+    duration: Duration,
+    color: egui::Color32,
+    active: bool,
+}
+
+impl FlashAnimation {
+    fn new(color: egui::Color32) -> Self {
+        Self {
+            start_time: Instant::now(),
+            duration: Duration::from_millis(400), // Longer duration so users can actually see it
+            color,
+            active: true,
+        }
+    }
+
+    fn update(&mut self) -> f32 {
+        if !self.active {
+            return 0.0;
+        }
+
+        let elapsed = self.start_time.elapsed();
+        if elapsed >= self.duration {
+            self.active = false;
+            return 0.0;
+        }
+
+        // Stronger easing function for better visibility
+        let progress = elapsed.as_secs_f32() / self.duration.as_secs_f32();
+        let intensity = 1.0 - progress;
+        // Use quadratic easing for more visible effect
+        intensity * intensity
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+
+    #[allow(dead_code)]
+    fn reset(&mut self) {
+        self.active = false;
+    }
+}
+
+// Optimized texture cache with GPU acceleration focus
+struct TextureCache {
+    images: HashMap<String, OptimizedImage>,
+    last_used: HashMap<String, Instant>,
+    max_cache_size: usize,
+    total_memory_estimate: usize, // Track approximate memory usage
+    max_memory_mb: usize,
+}
+
+impl TextureCache {
+    fn new() -> Self {
+        Self {
+            images: HashMap::new(),
+            last_used: HashMap::new(),
+            max_cache_size: 15, // Increased cache size for better performance
+            total_memory_estimate: 0,
+            max_memory_mb: 512, // 512MB texture cache limit
+        }
+    }
+
+    fn get_or_create_optimized<F>(&mut self, key: String, ctx: &egui::Context, create_fn: F) -> &egui::TextureHandle
+    where
+        F: FnOnce() -> DynamicImage,
+    {
+        self.last_used.insert(key.clone(), Instant::now());
+
+        if !self.images.contains_key(&key) {
+            // Clean cache if needed
+            if self.images.len() >= self.max_cache_size || self.total_memory_estimate > self.max_memory_mb * 1024 * 1024 {
+                self.cleanup_cache();
+            }
+
+            let image = create_fn();
+            let memory_estimate = (image.width() * image.height() * 4) as usize; // RGBA estimation
+            self.total_memory_estimate += memory_estimate;
+
+            let optimized_image = OptimizedImage::new(image);
+            self.images.insert(key.clone(), optimized_image);
+        }
+
+        // Get the texture from the optimized image
+        let optimized_image = self.images.get_mut(&key).unwrap();
+        optimized_image.create_optimized_texture(ctx, key.clone())
+    }
+
+    fn cleanup_cache(&mut self) {
+        let cutoff = Instant::now() - Duration::from_secs(45); // Keep images for 45 seconds
+
+        let mut to_remove = Vec::new();
+        for (key, &last_used) in &self.last_used {
+            if last_used < cutoff {
+                to_remove.push(key.clone());
+            }
+        }
+
+        // If memory pressure is high, remove more aggressively
+        if self.total_memory_estimate > self.max_memory_mb * 1024 * 1024 {
+            let mut entries: Vec<_> = self.last_used.iter().collect();
+            entries.sort_by_key(|(_, &time)| time);
+
+            let additional_to_remove = (self.images.len() / 2).max(3); // Remove at least half when under memory pressure
+            for (key, _) in entries.iter().take(additional_to_remove) {
+                to_remove.push((*key).clone());
+            }
+        }
+
+        // Remove selected items and update memory estimate
+        for key in to_remove {
+            if let Some(optimized_image) = self.images.remove(&key) {
+                let memory_estimate = (optimized_image.original.width() * optimized_image.original.height() * 4) as usize;
+                self.total_memory_estimate = self.total_memory_estimate.saturating_sub(memory_estimate);
+            }
+            self.last_used.remove(&key);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.images.clear();
+        self.last_used.clear();
+        self.total_memory_estimate = 0;
+    }
+
+    fn get_memory_usage_mb(&self) -> f32 {
+        self.total_memory_estimate as f32 / (1024.0 * 1024.0)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct SimpleNeuralNetwork {
-    weights1: Array2<f32>, // 512 -> 128
+    weights1: Array2<f32>, // 1000 -> 128
     bias1: Array1<f32>,
     weights2: Array2<f32>, // 128 -> 64
     bias2: Array1<f32>,
@@ -64,8 +335,8 @@ struct GpuNeuralNetwork {
 
 impl SimpleNeuralNetwork {
     fn new() -> Self {
-        // Xavier initialization using ndarray-rand
-        let weights1 = Array2::random((512, 128), Uniform::new(-0.1, 0.1));
+        // Xavier initialization using ndarray-rand - Updated for 1000 input features
+        let weights1 = Array2::random((1000, 128), Uniform::new(-0.1, 0.1));
         let bias1 = Array1::zeros(128);
         let weights2 = Array2::random((128, 64), Uniform::new(-0.1, 0.1));
         let bias2 = Array1::zeros(64);
@@ -114,8 +385,8 @@ impl SimpleNeuralNetwork {
     }
 
     fn predict(&self, features: &[f32]) -> Result<u8> {
-        if features.len() != 512 {
-            return Err(anyhow::anyhow!("Expected 512 features, got {}", features.len()));
+        if features.len() != 1000 {
+            return Err(anyhow::anyhow!("Expected 1000 features, got {}", features.len()));
         }
 
         let input = Array1::from_vec(features.to_vec());
@@ -163,7 +434,7 @@ impl SimpleNeuralNetwork {
             let mut total_loss = 0.0;
 
             for sample in validation_data {
-                if sample.features.len() == 512 {
+                if sample.features.len() == 1000 {
                     if let Ok(prediction) = self.predict(&sample.features) {
                         if prediction == sample.rating {
                             correct_predictions += 1;
@@ -209,7 +480,7 @@ impl SimpleNeuralNetwork {
 
         for _ in 0..epochs {
             let mut shuffled_data = recent_data.to_vec();
-            shuffled_data.shuffle(&mut thread_rng());
+            shuffled_data.shuffle(&mut rng());
 
             for batch in shuffled_data.chunks(batch_size) {
                 self.train_batch(batch)?;
@@ -226,7 +497,7 @@ impl SimpleNeuralNetwork {
 
         for _ in 0..epochs {
             let mut shuffled_data = training_data.to_vec();
-            shuffled_data.shuffle(&mut thread_rng());
+            shuffled_data.shuffle(&mut rng());
 
             for batch in shuffled_data.chunks(batch_size) {
                 self.train_batch(batch)?;
@@ -248,7 +519,7 @@ impl SimpleNeuralNetwork {
         let mut grad_b3: Array1<f32> = Array1::zeros(self.bias3.dim());
 
         for sample in batch {
-            if sample.features.len() != 512 {
+            if sample.features.len() != 1000 {
                 continue;
             }
 
@@ -296,7 +567,7 @@ impl GpuNeuralNetwork {
         let varmap = VarMap::new();
         let vs = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
-        let layer1 = candle_nn::linear(512, 128, vs.pp("layer1"))?;
+        let layer1 = candle_nn::linear(1000, 128, vs.pp("layer1"))?;
         let layer2 = candle_nn::linear(128, 64, vs.pp("layer2"))?;
         let layer3 = candle_nn::linear(64, 5, vs.pp("layer3"))?;
 
@@ -324,11 +595,11 @@ impl GpuNeuralNetwork {
     }
 
     fn predict(&self, features: &[f32]) -> Result<u8> {
-        if features.len() != 512 {
-            return Err(anyhow::anyhow!("Expected 512 features, got {}", features.len()));
+        if features.len() != 1000 {
+            return Err(anyhow::anyhow!("Expected 1000 features, got {}", features.len()));
         }
 
-        let input = CandleTensor::from_slice(features, (1, 512), &self.device)?;
+        let input = CandleTensor::from_slice(features, (1, 1000), &self.device)?;
         let output = self.forward(&input)?;
         let output_vec = output.to_vec2::<f32>()?;
 
@@ -371,7 +642,7 @@ impl GpuNeuralNetwork {
             let mut total_loss = 0.0;
 
             for sample in validation_data {
-                if sample.features.len() == 512 {
+                if sample.features.len() == 1000 {
                     if let Ok(prediction) = self.predict(&sample.features) {
                         if prediction == sample.rating {
                             correct_predictions += 1;
@@ -379,7 +650,7 @@ impl GpuNeuralNetwork {
                     }
 
                     // Calculate loss
-                    let input = CandleTensor::from_slice(&sample.features, (1, 512), &self.device)?;
+                    let input = CandleTensor::from_slice(&sample.features, (1, 1000), &self.device)?;
                     let output = self.forward(&input)?;
                     let target_class = (sample.rating - 1) as usize;
 
@@ -425,7 +696,7 @@ impl GpuNeuralNetwork {
 
         for _ in 0..epochs {
             let mut shuffled_data = training_data.to_vec();
-            shuffled_data.shuffle(&mut thread_rng());
+            shuffled_data.shuffle(&mut rng());
 
             let batch_size = training_data.len().min(32);
             for batch in shuffled_data.chunks(batch_size) {
@@ -442,7 +713,7 @@ impl GpuNeuralNetwork {
         let mut targets = Vec::new();
 
         for sample in batch {
-            if sample.features.len() == 512 {
+            if sample.features.len() == 1000 {
                 inputs.extend_from_slice(&sample.features);
                 targets.push((sample.rating - 1) as usize);
             }
@@ -452,17 +723,14 @@ impl GpuNeuralNetwork {
             return Ok(());
         }
 
-        let input_tensor = CandleTensor::from_slice(&inputs, (batch_size, 512), &self.device)?;
+        let input_tensor = CandleTensor::from_slice(&inputs, (batch_size, 1000), &self.device)?;
         let output = self.forward(&input_tensor)?;
 
-        // Create target tensor
-        let mut target_data = vec![0.0f32; batch_size * 5];
-        for (i, &target_class) in targets.iter().enumerate() {
-            target_data[i * 5 + target_class] = 1.0;
-        }
-        let target_tensor = CandleTensor::from_slice(&target_data, (batch_size, 5), &self.device)?;
+        // Create target tensor with class indices (not one-hot)
+        let target_indices: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
+        let target_tensor = CandleTensor::from_slice(&target_indices, batch_size, &self.device)?;
 
-        // Cross-entropy loss
+        // Cross-entropy loss expects class indices, not one-hot encoding
         let loss = candle_nn::loss::cross_entropy(&output, &target_tensor)?;
 
         optimizer.backward_step(&loss)?;
@@ -477,6 +745,7 @@ struct RatingPredictor {
     gpu_network: Option<GpuNeuralNetwork>,
     cpu_network: SimpleNeuralNetwork,
     model_file: PathBuf,
+    #[allow(dead_code)]
     use_gpu: bool,
 }
 
@@ -498,10 +767,12 @@ impl RatingPredictor {
             #[cfg(all(target_os = "windows", target_env = "gnu"))]
             {
                 // Windows GNU: CUDA is not supported due to linking issues
-                println!("Windows GNU detected: CUDA not supported, using CPU-only mode");
-                println!("For GPU acceleration on Windows, please use the MSVC toolchain:");
-                println!("  rustup default stable-x86_64-pc-windows-msvc");
-                println!("  cargo build --features cuda --target x86_64-pc-windows-msvc");
+                if !GPU_MESSAGE_PRINTED.swap(true, Ordering::Relaxed) {
+                    println!("Windows GNU detected: CUDA not supported, using CPU-only mode");
+                    println!("For GPU acceleration on Windows, please use the MSVC toolchain:");
+                    println!("  rustup default stable-x86_64-pc-windows-msvc");
+                    println!("  cargo build --features cuda --target x86_64-pc-windows-msvc");
+                }
                 (None, false)
             }
             #[cfg(not(all(target_os = "windows", target_env = "gnu")))]
@@ -510,11 +781,15 @@ impl RatingPredictor {
                     Ok(device) => {
                         match GpuNeuralNetwork::new(device) {
                             Ok(gpu_net) => {
-                                println!("GPU acceleration enabled with CUDA");
+                                if !GPU_MESSAGE_PRINTED.swap(true, Ordering::Relaxed) {
+                                    println!("GPU acceleration enabled with CUDA");
+                                }
                                 (Some(gpu_net), true)
                             }
                             Err(e) => {
-                                eprintln!("Failed to initialize GPU network: {}, falling back to CPU", e);
+                                if !GPU_MESSAGE_PRINTED.swap(true, Ordering::Relaxed) {
+                                    eprintln!("Failed to initialize GPU network: {}, falling back to CPU", e);
+                                }
                                 (None, false)
                             }
                         }
@@ -525,17 +800,23 @@ impl RatingPredictor {
                             Ok(device) => {
                                 match GpuNeuralNetwork::new(device) {
                                     Ok(gpu_net) => {
-                                        println!("GPU acceleration enabled with Metal");
+                                        if !GPU_MESSAGE_PRINTED.swap(true, Ordering::Relaxed) {
+                                            println!("GPU acceleration enabled with Metal");
+                                        }
                                         (Some(gpu_net), true)
                                     }
                                     Err(e) => {
-                                        eprintln!("Failed to initialize GPU network: {}, falling back to CPU", e);
+                                        if !GPU_MESSAGE_PRINTED.swap(true, Ordering::Relaxed) {
+                                            eprintln!("Failed to initialize GPU network: {}, falling back to CPU", e);
+                                        }
                                         (None, false)
                                     }
                                 }
                             }
                             Err(_) => {
-                                println!("No GPU available, using CPU");
+                                if !GPU_MESSAGE_PRINTED.swap(true, Ordering::Relaxed) {
+                                    println!("No GPU available, using CPU");
+                                }
                                 (None, false)
                             }
                         }
@@ -552,6 +833,7 @@ impl RatingPredictor {
             gpu_network,
             cpu_network,
             model_file,
+            #[allow(dead_code)]
             use_gpu,
         })
     }
@@ -602,15 +884,12 @@ impl RatingPredictor {
 struct ImageViewer {
     images: Vec<PathBuf>,
     current_index: usize,
-    loaded_images: Vec<Option<DynamicImage>>,
-    image_textures: Vec<Option<egui::TextureHandle>>,
-    image_loading_tx: Sender<(usize, PathBuf)>,
-    image_loading_rx: Receiver<(usize, DynamicImage)>,
+    loaded_images: HashMap<usize, DynamicImage>, // Changed to HashMap for better tracking
+    texture_cache: TextureCache,
     favorites_dir: PathBuf,
     deleted_dir: PathBuf,
     favorite_counter: usize,
-    flash_state: f32, // 0.0 to 1.0, where 1.0 is full flash
-    flash_color: egui::Color32, // Color of the flash effect
+    flash_animation: FlashAnimation,
     state_file: PathBuf,
     current_directory: String,
     // Rating system fields
@@ -622,12 +901,17 @@ struct ImageViewer {
     current_rating: Option<u8>,
     suggested_rating: Option<u8>,
     image_features_cache: HashMap<String, Vec<f32>>,
-    // Background processing
-    feature_extraction_tx: Sender<(String, DynamicImage)>,
+    // Background processing - simplified
     feature_extraction_rx: Receiver<(String, Vec<f32>)>,
     prediction_tx: Sender<(String, Vec<f32>)>,
     prediction_rx: Receiver<(String, u8)>,
-    pending_suggestions: HashMap<String, bool>, // Track which images are being processed
+    pending_suggestions: HashMap<String, bool>,
+    // Simplified image processing - removed async loading for stability
+    // Performance optimization fields
+    last_repaint_request: Instant,
+    dirty_state: bool,
+    last_background_check: Instant,
+    onnx_session: Arc<ort::Session>,
 }
 
 impl ImageViewer {
@@ -652,20 +936,11 @@ impl ImageViewer {
             anyhow::bail!("No images found in the specified directory");
         }
 
-        let (tx, rx) = channel();
-        let (loading_tx, loading_rx) = channel();
+        let (_tx, _rx) = channel::<(usize, PathBuf)>();
+        let (_loading_tx, _loading_rx) = channel::<(usize, DynamicImage)>();
 
-        // Start image loading thread
-        thread::spawn(move || {
-            while let Ok((index, path)) = rx.recv() {
-                if let Ok(img) = image::open(&path) {
-                    let _ = loading_tx.send((index, img));
-                }
-            }
-        });
-
-        // Background processing channels
-        let (feature_tx, feature_rx) = channel::<(String, DynamicImage)>();
+        // Background processing channels - simplified for predictions only
+        let (_feature_tx, feature_rx) = channel::<(String, DynamicImage)>();
         let (feature_result_tx, feature_result_rx) = channel::<(String, Vec<f32>)>();
         let (prediction_tx, prediction_rx) = channel::<(String, Vec<f32>)>();
         let (prediction_result_tx, prediction_result_rx) = channel::<(String, u8)>();
@@ -675,9 +950,13 @@ impl ImageViewer {
         let thread_predictor = shared_predictor.clone();
 
         // Start feature extraction thread
+        let environment = Arc::new(Environment::builder().with_name("iv-onnx").build()?);
+        let model_path = find_model_path()?;
+        let session = Arc::new(SessionBuilder::new(&environment)?.with_model_from_file(model_path)?);
+        let onnx_session_thread = session.clone();
         thread::spawn(move || {
             while let Ok((hash, image)) = feature_rx.recv() {
-                let features = Self::extract_features_static(&image);
+                let features = ImageViewer::extract_features_static(&image, &onnx_session_thread);
                 let _ = feature_result_tx.send((hash, features));
             }
         });
@@ -756,15 +1035,12 @@ impl ImageViewer {
         let mut viewer = ImageViewer {
             images,
             current_index,
-            loaded_images: vec![None; 5], // Current + 2 before + 2 after
-            image_textures: vec![None; 5],
-            image_loading_tx: tx,
-            image_loading_rx: loading_rx,
+            loaded_images: HashMap::new(),
+            texture_cache: TextureCache::new(),
             favorites_dir,
             deleted_dir,
             favorite_counter,
-            flash_state: 0.0,
-            flash_color: egui::Color32::WHITE, // Default flash color
+            flash_animation: FlashAnimation::new(egui::Color32::WHITE), // Default flash color
             state_file,
             current_directory,
             // Rating system fields - now global
@@ -776,12 +1052,17 @@ impl ImageViewer {
             current_rating: None,
             suggested_rating: None,
             image_features_cache: HashMap::new(),
-            // Background processing
-            feature_extraction_tx: feature_tx,
+            // Background processing - simplified
             feature_extraction_rx: feature_result_rx,
             prediction_tx: prediction_tx,
             prediction_rx: prediction_result_rx,
             pending_suggestions: HashMap::new(),
+            // Simplified image processing - removed async loading for stability
+            // Performance optimization fields
+            last_repaint_request: Instant::now(),
+            dirty_state: false,
+            last_background_check: Instant::now(),
+            onnx_session: session,
         };
 
         // Load initial images
@@ -796,51 +1077,57 @@ impl ImageViewer {
     }
 
     fn load_initial_images(&mut self) -> Result<()> {
-        // Load current image and 2 before and after
-        for i in 0..5 {
-            let index = if i < 2 {
-                self.current_index.saturating_sub(2 - i)
-            } else {
-                self.current_index + (i - 2)
-            };
+        // Load current image synchronously for immediate display
+        self.load_image_sync(self.current_index);
 
-            if index < self.images.len() {
-                self.load_image(index)?;
-            }
+        // Load a few nearby images for smooth navigation
+        if self.current_index > 0 {
+            self.load_image_sync(self.current_index - 1);
         }
+        if self.current_index + 1 < self.images.len() {
+            self.load_image_sync(self.current_index + 1);
+        }
+
         Ok(())
     }
 
-    fn load_image(&mut self, index: usize) -> Result<()> {
-        if index < self.images.len() {
-            let path = self.images[index].clone();
-            self.image_loading_tx.send((index, path))?;
+    fn load_image_sync(&mut self, index: usize) {
+        if index < self.images.len() && !self.loaded_images.contains_key(&index) {
+            let path = &self.images[index];
+            match image::open(path) {
+                Ok(img) => {
+                    self.loaded_images.insert(index, img);
+                }
+                Err(e) => {
+                    eprintln!("Failed to load image {}: {}", path.display(), e);
+                }
+            }
         }
+    }
+
+    fn load_image(&mut self, index: usize) -> Result<()> {
+        self.load_image_sync(index);
         Ok(())
     }
 
     fn update_loaded_images(&mut self) {
-        while let Ok((index, img)) = self.image_loading_rx.try_recv() {
-            let cache_index = if index < self.current_index {
-                if self.current_index - index <= 2 {
-                    2 - (self.current_index - index)
-                } else {
-                    continue;
-                }
-            } else if index > self.current_index {
-                if index - self.current_index <= 2 {
-                    2 + (index - self.current_index)
-                } else {
-                    continue;
-                }
-            } else {
-                2
-            };
+        // Keep a reasonable cache of loaded images around current position
+        let keep_range = 5; // Keep 5 images around current position
 
-            if cache_index < self.loaded_images.len() {
-                self.loaded_images[cache_index] = Some(img);
-                // Clear the corresponding texture to force a reload
-                self.image_textures[cache_index] = None;
+        // Remove images that are too far from current position
+        let current = self.current_index;
+        self.loaded_images.retain(|&index, _| {
+            index >= current.saturating_sub(keep_range) &&
+            index <= current.saturating_add(keep_range).min(self.images.len().saturating_sub(1))
+        });
+
+        // Load nearby images if not already loaded
+        for offset in 0..=2 {
+            if current >= offset {
+                self.load_image_sync(current - offset);
+            }
+            if current + offset < self.images.len() {
+                self.load_image_sync(current + offset);
             }
         }
     }
@@ -848,8 +1135,10 @@ impl ImageViewer {
     fn next_image(&mut self) -> Result<()> {
         if self.current_index + 1 < self.images.len() {
             self.current_index += 1;
-            // Clear the current textures to force reload
-            self.image_textures = vec![None; 5];
+            // Only clear texture cache if no flash animation is active
+            if !self.flash_animation.is_active() {
+                self.texture_cache.clear();
+            }
             // Load next image if needed
             if self.current_index + 2 < self.images.len() {
                 self.load_image(self.current_index + 2)?;
@@ -870,8 +1159,10 @@ impl ImageViewer {
     fn previous_image(&mut self) -> Result<()> {
         if self.current_index > 0 {
             self.current_index -= 1;
-            // Clear the current textures to force reload
-            self.image_textures = vec![None; 5];
+            // Only clear texture cache if no flash animation is active
+            if !self.flash_animation.is_active() {
+                self.texture_cache.clear();
+            }
             // Load next image if needed
             if self.current_index + 2 < self.images.len() {
                 self.load_image(self.current_index + 2)?;
@@ -902,8 +1193,7 @@ impl ImageViewer {
         fs::copy(current_image, &target_path)?;
         self.favorite_counter += 1;
 
-        self.flash_state = 1.0;
-        self.flash_color = egui::Color32::WHITE;
+        self.flash_animation = FlashAnimation::new(egui::Color32::WHITE);
 
         Ok(())
     }
@@ -928,8 +1218,8 @@ impl ImageViewer {
         self.images.remove(self.current_index);
 
         // Adjust the loaded images
-        self.loaded_images = vec![None; 5];
-        self.image_textures = vec![None; 5];
+        self.loaded_images = HashMap::new();
+        self.texture_cache.clear();
 
         // If we've deleted the last image, go to the previous one
         if self.current_index >= self.images.len() && !self.images.is_empty() {
@@ -937,8 +1227,7 @@ impl ImageViewer {
         }
 
         // Set flash state to red
-        self.flash_state = 1.0;
-        self.flash_color = egui::Color32::RED;
+        self.flash_animation = FlashAnimation::new(egui::Color32::RED);
 
         // Reload images around the current index
         self.load_initial_images()?;
@@ -1007,547 +1296,37 @@ impl ImageViewer {
         hex::encode(hasher.finalize())
     }
 
-    fn extract_features(&self, image: &DynamicImage) -> Vec<f32> {
-        Self::extract_features_static(image)
-    }
-
-    fn extract_features_static(image: &DynamicImage) -> Vec<f32> {
-        let mut features = Vec::with_capacity(512);
-
-        // Convert to different formats for analysis
-        let rgb = image.to_rgb8();
-        let gray = image.to_luma8();
-        let (width, height) = (rgb.width(), rgb.height());
-
-        // 1. Color histogram features (96 features: 32 each for R, G, B)
-        let mut r_hist = vec![0u32; 32];
-        let mut g_hist = vec![0u32; 32];
-        let mut b_hist = vec![0u32; 32];
-
-        for pixel in rgb.pixels() {
-            let r_bin = (pixel[0] as usize * 31) / 255;
-            let g_bin = (pixel[1] as usize * 31) / 255;
-            let b_bin = (pixel[2] as usize * 31) / 255;
-            r_hist[r_bin] += 1;
-            g_hist[g_bin] += 1;
-            b_hist[b_bin] += 1;
-        }
-
-        let total_pixels = (width * height) as f32;
-        for &count in &r_hist {
-            features.push(count as f32 / total_pixels);
-        }
-        for &count in &g_hist {
-            features.push(count as f32 / total_pixels);
-        }
-        for &count in &b_hist {
-            features.push(count as f32 / total_pixels);
-        }
-
-        // 2. Brightness and contrast statistics (8 features)
-        let gray_pixels: Vec<f32> = gray.pixels().map(|p| p[0] as f32 / 255.0).collect();
-        let mean_brightness = gray_pixels.iter().sum::<f32>() / gray_pixels.len() as f32;
-        let brightness_variance = gray_pixels.iter()
-            .map(|&x| (x - mean_brightness).powi(2))
-            .sum::<f32>() / gray_pixels.len() as f32;
-        let brightness_std = brightness_variance.sqrt();
-
-        // Contrast (RMS contrast)
-        let rms_contrast = brightness_std;
-
-        // Histogram-based contrast (difference between 95th and 5th percentiles)
-        let mut sorted_gray = gray_pixels.clone();
-        sorted_gray.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let p5 = sorted_gray[(sorted_gray.len() as f32 * 0.05) as usize];
-        let p95 = sorted_gray[(sorted_gray.len() as f32 * 0.95) as usize];
-        let percentile_contrast = p95 - p5;
-
-        features.extend_from_slice(&[
-            mean_brightness,
-            brightness_variance,
-            brightness_std,
-            rms_contrast,
-            percentile_contrast,
-            sorted_gray[sorted_gray.len() / 4], // 25th percentile
-            sorted_gray[sorted_gray.len() / 2], // median
-            sorted_gray[sorted_gray.len() * 3 / 4], // 75th percentile
-        ]);
-
-        // 3. Edge density and sharpness (Sobel operator) (4 features)
-        let mut edge_magnitude_sum = 0.0;
-        let mut strong_edges = 0;
-        let mut edge_magnitudes = Vec::new();
-
-        for y in 1..(height - 1) {
-            for x in 1..(width - 1) {
-                let get_gray = |x: u32, y: u32| -> f32 {
-                    gray.get_pixel(x, y)[0] as f32 / 255.0
-                };
-
-                // Sobel operators
-                let gx = -get_gray(x-1, y-1) - 2.0*get_gray(x-1, y) - get_gray(x-1, y+1)
-                        + get_gray(x+1, y-1) + 2.0*get_gray(x+1, y) + get_gray(x+1, y+1);
-                let gy = -get_gray(x-1, y-1) - 2.0*get_gray(x, y-1) - get_gray(x+1, y-1)
-                        + get_gray(x-1, y+1) + 2.0*get_gray(x, y+1) + get_gray(x+1, y+1);
-
-                let magnitude = (gx*gx + gy*gy).sqrt();
-                edge_magnitude_sum += magnitude;
-                edge_magnitudes.push(magnitude);
-
-                if magnitude > 0.1 { // Threshold for strong edges
-                    strong_edges += 1;
+    fn extract_features_static(image: &DynamicImage, session: &ort::Session) -> Vec<f32> {
+        // Resize and normalize image to 224x224, RGB
+        let resized = image.resize_exact(224, 224, image::imageops::FilterType::Lanczos3).to_rgb8();
+        let mut input = Array4::<f32>::zeros((1, 3, 224, 224));
+        let mean = [0.485, 0.456, 0.406];
+        let std = [0.229, 0.224, 0.225];
+        for y in 0..224 {
+            for x in 0..224 {
+                let pixel = resized.get_pixel(x, y);
+                for c in 0..3 {
+                    input[[0, c, y as usize, x as usize]] = (pixel[c] as f32 / 255.0 - mean[c]) / std[c];
                 }
             }
         }
-
-        let edge_density = edge_magnitude_sum / ((width - 2) * (height - 2)) as f32;
-        let strong_edge_ratio = strong_edges as f32 / ((width - 2) * (height - 2)) as f32;
-
-        // Edge magnitude statistics
-        edge_magnitudes.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let edge_median = edge_magnitudes[edge_magnitudes.len() / 2];
-        let edge_95th = edge_magnitudes[(edge_magnitudes.len() as f32 * 0.95) as usize];
-
-        features.extend_from_slice(&[edge_density, strong_edge_ratio, edge_median, edge_95th]);
-
-        // 4. Color saturation and vibrancy (6 features)
-        let mut saturation_sum = 0.0;
-        let mut hue_distribution = vec![0u32; 12]; // 12 hue bins
-        let mut saturated_pixels = 0;
-
-        for pixel in rgb.pixels() {
-            let r = pixel[0] as f32 / 255.0;
-            let g = pixel[1] as f32 / 255.0;
-            let b = pixel[2] as f32 / 255.0;
-
-            let max_val = r.max(g).max(b);
-            let min_val = r.min(g).min(b);
-            let delta = max_val - min_val;
-
-            // Saturation
-            let saturation = if max_val > 0.0 { delta / max_val } else { 0.0 };
-            saturation_sum += saturation;
-
-            if saturation > 0.3 {
-                saturated_pixels += 1;
-
-                // Hue calculation for saturated pixels
-                if delta > 0.0 {
-                    let hue = if max_val == r {
-                        ((g - b) / delta) % 6.0
-                    } else if max_val == g {
-                        (b - r) / delta + 2.0
-                    } else {
-                        (r - g) / delta + 4.0
-                    };
-                    let hue_normalized = (hue * 60.0 + 360.0) % 360.0;
-                    let hue_bin = (hue_normalized / 30.0) as usize % 12;
-                    hue_distribution[hue_bin] += 1;
-                }
-            }
-        }
-
-        let avg_saturation = saturation_sum / total_pixels;
-        let saturated_pixel_ratio = saturated_pixels as f32 / total_pixels;
-
-        // Hue diversity (entropy-like measure)
-        let mut hue_entropy = 0.0;
-        if saturated_pixels > 0 {
-            for &count in &hue_distribution {
-                if count > 0 {
-                    let p = count as f32 / saturated_pixels as f32;
-                    hue_entropy -= p * p.log2();
-                }
-            }
-        }
-
-        features.extend_from_slice(&[
-            avg_saturation,
-            saturated_pixel_ratio,
-            hue_entropy,
-            hue_distribution.iter().max().unwrap_or(&0).clone() as f32 / saturated_pixels.max(1) as f32, // dominant hue strength
-        ]);
-
-        // 5. Texture analysis using Local Binary Patterns (simplified) (16 features)
-        let mut lbp_histogram = vec![0u32; 16]; // Simplified 4-bit LBP
-
-        for y in 1..(height - 1) {
-            for x in 1..(width - 1) {
-                let center = gray.get_pixel(x, y)[0];
-                let mut lbp_code = 0u8;
-
-                // 4-neighbor LBP (simplified)
-                let neighbors = [
-                    gray.get_pixel(x, y-1)[0], // top
-                    gray.get_pixel(x+1, y)[0], // right
-                    gray.get_pixel(x, y+1)[0], // bottom
-                    gray.get_pixel(x-1, y)[0], // left
-                ];
-
-                for (i, &neighbor) in neighbors.iter().enumerate() {
-                    if neighbor >= center {
-                        lbp_code |= 1 << i;
-                    }
-                }
-
-                lbp_histogram[lbp_code as usize] += 1;
-            }
-        }
-
-        let lbp_total = ((width - 2) * (height - 2)) as f32;
-        for &count in &lbp_histogram {
-            features.push(count as f32 / lbp_total);
-        }
-
-        // 6. Noise estimation (4 features)
-        // High-frequency noise estimation using Laplacian
-        let mut noise_sum = 0.0;
-        let mut high_freq_energy = 0.0;
-
-        for y in 1..(height - 1) {
-            for x in 1..(width - 1) {
-                let center = gray.get_pixel(x, y)[0] as f32;
-                let laplacian = -4.0 * center
-                    + gray.get_pixel(x-1, y)[0] as f32
-                    + gray.get_pixel(x+1, y)[0] as f32
-                    + gray.get_pixel(x, y-1)[0] as f32
-                    + gray.get_pixel(x, y+1)[0] as f32;
-
-                noise_sum += laplacian.abs();
-                high_freq_energy += laplacian * laplacian;
-            }
-        }
-
-        let noise_level = noise_sum / ((width - 2) * (height - 2)) as f32;
-        let high_freq_avg = high_freq_energy / ((width - 2) * (height - 2)) as f32;
-
-        features.extend_from_slice(&[
-            noise_level,
-            high_freq_avg,
-            noise_level / (mean_brightness + 0.001), // noise-to-signal ratio
-            high_freq_avg.sqrt(), // RMS high frequency
-        ]);
-
-        // 7. Composition features (8 features)
-        // Rule of thirds analysis
-        let third_w = width / 3;
-        let third_h = height / 3;
-
-        let mut region_brightness = vec![0.0f32; 9];
-        let mut region_counts = vec![0u32; 9];
-
-        for y in 0..height {
-            for x in 0..width {
-                let region_x = (x / third_w).min(2) as usize;
-                let region_y = (y / third_h).min(2) as usize;
-                let region_idx = region_y * 3 + region_x;
-
-                region_brightness[region_idx] += gray.get_pixel(x, y)[0] as f32;
-                region_counts[region_idx] += 1;
-            }
-        }
-
-        for i in 0..9 {
-            if region_counts[i] > 0 {
-                region_brightness[i] /= region_counts[i] as f32;
-            }
-        }
-
-        // Center vs edges brightness difference
-        let center_brightness = region_brightness[4]; // center region
-        let edge_brightness = (region_brightness[0] + region_brightness[2] +
-                              region_brightness[6] + region_brightness[8]) / 4.0; // corners
-        let center_edge_diff = (center_brightness - edge_brightness).abs();
-
-        features.extend_from_slice(&region_brightness);
-        features.push(center_edge_diff);
-
-        // 8. Aspect ratio and resolution features (4 features)
-        let aspect_ratio = width as f32 / height as f32;
-        let resolution_score = (width * height) as f32 / (1920.0 * 1080.0); // normalized to 1080p
-        let width_score = width as f32 / 1920.0;
-        let height_score = height as f32 / 1080.0;
-
-        features.extend_from_slice(&[aspect_ratio, resolution_score, width_score, height_score]);
-
-        // 9. Shape and geometry analysis (32 features)
-        let shape_features = Self::extract_shape_features(&gray, width, height);
-        features.extend_from_slice(&shape_features);
-
-        // Ensure we have exactly 512 features
-        features.resize(512, 0.0);
-
-        // Normalize features to prevent any single feature from dominating
-        let max_val = features.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
-        if max_val > 0.0 {
-            for feature in &mut features {
-                *feature /= max_val;
-            }
-        }
-
+        // Run through ONNX model
+        let input_dyn = input.into_dyn();
+        let input_cow = CowArray::from(&input_dyn);
+        let input_tensor = Value::from_array(session.allocator(), &input_cow).expect("Failed to create input tensor");
+        let outputs = session.run(vec![input_tensor]).expect("ONNX inference failed");
+        let features_tensor = outputs[0].try_extract::<f32>().expect("Failed to extract output");
+        let features: Vec<f32> = features_tensor.view().as_slice().unwrap().to_vec();
         features
     }
 
-    fn extract_shape_features(gray: &image::GrayImage, width: u32, height: u32) -> Vec<f32> {
-        let mut shape_features = Vec::with_capacity(32);
-
-        // 1. Corner detection using Harris corner detector (simplified) (4 features)
-        let mut corner_count = 0;
-        let mut corner_strength_sum = 0.0;
-        let mut corner_responses = Vec::new();
-
-        for y in 2..(height - 2) {
-            for x in 2..(width - 2) {
-                // Simplified Harris corner response
-                let mut ix = 0.0f32;
-                let mut iy = 0.0f32;
-                let mut ixy = 0.0f32;
-
-                // Calculate gradients in 3x3 window
-                for dy in -1..=1 {
-                    for dx in -1..=1 {
-                        let px = gray.get_pixel(x + dx as u32, y + dy as u32)[0] as f32;
-                        let gx = if dx != 0 { dx as f32 * px } else { 0.0 };
-                        let gy = if dy != 0 { dy as f32 * px } else { 0.0 };
-
-                        ix += gx * gx;
-                        iy += gy * gy;
-                        ixy += gx * gy;
-                    }
-                }
-
-                // Harris response
-                let det = ix * iy - ixy * ixy;
-                let trace = ix + iy;
-                let response = det - 0.04 * trace * trace;
-
-                if response > 0.01 {
-                    corner_count += 1;
-                    corner_strength_sum += response;
-                    corner_responses.push(response);
-                }
-            }
-        }
-
-        let corner_density = corner_count as f32 / ((width - 4) * (height - 4)) as f32;
-        let avg_corner_strength = if corner_count > 0 { corner_strength_sum / corner_count as f32 } else { 0.0 };
-
-        corner_responses.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        let max_corner_strength = corner_responses.first().copied().unwrap_or(0.0);
-        let corner_strength_variance = if corner_responses.len() > 1 {
-            let mean = avg_corner_strength;
-            corner_responses.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / corner_responses.len() as f32
-        } else { 0.0 };
-
-        shape_features.extend_from_slice(&[corner_density, avg_corner_strength, max_corner_strength, corner_strength_variance]);
-
-        // 2. Line detection using Hough transform (simplified) (8 features)
-        let mut horizontal_lines = 0;
-        let mut vertical_lines = 0;
-        let mut diagonal_lines = 0;
-        let mut line_strength_sum = 0.0;
-
-        // Simplified line detection by analyzing edge directions
-        for y in 1..(height - 1) {
-            for x in 1..(width - 1) {
-                let gx = gray.get_pixel(x + 1, y)[0] as f32 - gray.get_pixel(x - 1, y)[0] as f32;
-                let gy = gray.get_pixel(x, y + 1)[0] as f32 - gray.get_pixel(x, y - 1)[0] as f32;
-
-                let magnitude = (gx * gx + gy * gy).sqrt();
-                if magnitude > 20.0 {
-                    let angle = gy.atan2(gx).abs();
-                    line_strength_sum += magnitude;
-
-                    if angle < 0.3 || angle > 2.8 { // ~horizontal
-                        horizontal_lines += 1;
-                    } else if angle > 1.3 && angle < 1.8 { // ~vertical
-                        vertical_lines += 1;
-                    } else { // diagonal
-                        diagonal_lines += 1;
-                    }
-                }
-            }
-        }
-
-        let total_pixels = ((width - 2) * (height - 2)) as f32;
-        let horizontal_line_density = horizontal_lines as f32 / total_pixels;
-        let vertical_line_density = vertical_lines as f32 / total_pixels;
-        let diagonal_line_density = diagonal_lines as f32 / total_pixels;
-        let avg_line_strength = line_strength_sum / total_pixels;
-        let line_orientation_ratio = if vertical_lines > 0 { horizontal_lines as f32 / vertical_lines as f32 } else { 0.0 };
-        let total_line_density = (horizontal_lines + vertical_lines + diagonal_lines) as f32 / total_pixels;
-        let line_complexity = if total_line_density > 0.0 { diagonal_line_density / total_line_density } else { 0.0 };
-        let line_regularity = if total_line_density > 0.0 {
-            (horizontal_line_density + vertical_line_density) / total_line_density
-        } else { 0.0 };
-
-        shape_features.extend_from_slice(&[
-            horizontal_line_density, vertical_line_density, diagonal_line_density, avg_line_strength,
-            line_orientation_ratio, total_line_density, line_complexity, line_regularity
-        ]);
-
-        // 3. Symmetry analysis (8 features)
-        let center_x = width / 2;
-        let center_y = height / 2;
-
-        // Horizontal symmetry
-        let mut h_symmetry_error = 0.0;
-        let mut h_symmetry_count = 0;
-        for y in 0..height {
-            for x in 0..center_x {
-                let mirror_x = width - 1 - x;
-                if mirror_x < width {
-                    let left_pixel = gray.get_pixel(x, y)[0] as f32;
-                    let right_pixel = gray.get_pixel(mirror_x, y)[0] as f32;
-                    h_symmetry_error += (left_pixel - right_pixel).abs();
-                    h_symmetry_count += 1;
-                }
-            }
-        }
-        let horizontal_symmetry = if h_symmetry_count > 0 {
-            1.0 - (h_symmetry_error / (h_symmetry_count as f32 * 255.0))
-        } else { 0.0 };
-
-        // Vertical symmetry
-        let mut v_symmetry_error = 0.0;
-        let mut v_symmetry_count = 0;
-        for y in 0..center_y {
-            for x in 0..width {
-                let mirror_y = height - 1 - y;
-                if mirror_y < height {
-                    let top_pixel = gray.get_pixel(x, y)[0] as f32;
-                    let bottom_pixel = gray.get_pixel(x, mirror_y)[0] as f32;
-                    v_symmetry_error += (top_pixel - bottom_pixel).abs();
-                    v_symmetry_count += 1;
-                }
-            }
-        }
-        let vertical_symmetry = if v_symmetry_count > 0 {
-            1.0 - (v_symmetry_error / (v_symmetry_count as f32 * 255.0))
-        } else { 0.0 };
-
-        // Diagonal symmetries (simplified)
-        let mut d1_symmetry_error = 0.0;
-        let mut d2_symmetry_error = 0.0;
-        let mut d_symmetry_count = 0;
-
-        let min_dim = width.min(height);
-        for i in 0..min_dim {
-            for j in 0..min_dim {
-                if i < width && j < height && j < width && i < height {
-                    let p1 = gray.get_pixel(i, j)[0] as f32;
-                    let p2 = gray.get_pixel(j, i)[0] as f32; // Main diagonal
-                    let p3 = gray.get_pixel(min_dim - 1 - i, j)[0] as f32;
-                    let p4 = gray.get_pixel(min_dim - 1 - j, i)[0] as f32; // Anti-diagonal
-
-                    d1_symmetry_error += (p1 - p2).abs();
-                    d2_symmetry_error += (p3 - p4).abs();
-                    d_symmetry_count += 1;
-                }
-            }
-        }
-
-        let diagonal1_symmetry = if d_symmetry_count > 0 {
-            1.0 - (d1_symmetry_error / (d_symmetry_count as f32 * 255.0))
-        } else { 0.0 };
-        let diagonal2_symmetry = if d_symmetry_count > 0 {
-            1.0 - (d2_symmetry_error / (d_symmetry_count as f32 * 255.0))
-        } else { 0.0 };
-
-        let overall_symmetry = (horizontal_symmetry + vertical_symmetry + diagonal1_symmetry + diagonal2_symmetry) / 4.0;
-        let symmetry_variance = [horizontal_symmetry, vertical_symmetry, diagonal1_symmetry, diagonal2_symmetry]
-            .iter().map(|&x| (x - overall_symmetry).powi(2)).sum::<f32>() / 4.0;
-        let max_symmetry = [horizontal_symmetry, vertical_symmetry, diagonal1_symmetry, diagonal2_symmetry]
-            .iter().fold(0.0f32, |acc, &x| acc.max(x));
-        let symmetry_bias = if overall_symmetry > 0.0 { max_symmetry / overall_symmetry } else { 0.0 };
-
-        shape_features.extend_from_slice(&[
-            horizontal_symmetry, vertical_symmetry, diagonal1_symmetry, diagonal2_symmetry,
-            overall_symmetry, symmetry_variance, max_symmetry, symmetry_bias
-        ]);
-
-        // 4. Geometric shape detection (12 features)
-        // Circle detection using Hough circle transform (simplified)
-        let mut circle_score = 0.0;
-
-        // Analyze edge curvature for circles
-        let mut curvature_sum = 0.0;
-        let mut curvature_count = 0;
-
-        for y in 2..(height - 2) {
-            for x in 2..(width - 2) {
-                // Calculate local curvature using second derivatives
-                let center = gray.get_pixel(x, y)[0] as f32;
-                let left = gray.get_pixel(x - 1, y)[0] as f32;
-                let right = gray.get_pixel(x + 1, y)[0] as f32;
-                let top = gray.get_pixel(x, y - 1)[0] as f32;
-                let bottom = gray.get_pixel(x, y + 1)[0] as f32;
-
-                let second_deriv_x = left - 2.0 * center + right;
-                let second_deriv_y = top - 2.0 * center + bottom;
-                let curvature = (second_deriv_x.abs() + second_deriv_y.abs()) / 2.0;
-
-                if curvature > 5.0 {
-                    curvature_sum += curvature;
-                    curvature_count += 1;
-
-                    // High curvature suggests circular features
-                    if curvature > 15.0 {
-                        circle_score += 1.0;
-                    }
-                }
-            }
-        }
-
-        circle_score /= total_pixels;
-        let avg_curvature = if curvature_count > 0 { curvature_sum / curvature_count as f32 } else { 0.0 };
-
-        // Rectangle detection (look for right angles and parallel lines)
-        let rectangle_score = (horizontal_line_density + vertical_line_density) * line_regularity;
-
-        // Triangle detection (look for three dominant edge directions)
-        let edge_direction_entropy = if total_line_density > 0.0 {
-            let h_ratio = horizontal_line_density / total_line_density;
-            let v_ratio = vertical_line_density / total_line_density;
-            let d_ratio = diagonal_line_density / total_line_density;
-
-            let mut entropy = 0.0;
-            if h_ratio > 0.0 { entropy -= h_ratio * h_ratio.log2(); }
-            if v_ratio > 0.0 { entropy -= v_ratio * v_ratio.log2(); }
-            if d_ratio > 0.0 { entropy -= d_ratio * d_ratio.log2(); }
-            entropy
-        } else { 0.0 };
-
-        let triangle_score = edge_direction_entropy * diagonal_line_density;
-
-        // Additional geometric features
-        let shape_complexity = corner_density * total_line_density;
-        let geometric_regularity = (rectangle_score + overall_symmetry) / 2.0;
-        let organic_vs_geometric = circle_score / (rectangle_score + 0.001);
-        let edge_coherence = avg_line_strength / (avg_curvature + 1.0);
-        let structural_balance = overall_symmetry * geometric_regularity;
-        let shape_diversity = edge_direction_entropy;
-        let angular_features = corner_density / (circle_score + 0.001);
-        let geometric_harmony = (overall_symmetry + geometric_regularity + line_regularity) / 3.0;
-
-        shape_features.extend_from_slice(&[
-            circle_score, rectangle_score, triangle_score, avg_curvature,
-            shape_complexity, geometric_regularity, organic_vs_geometric, edge_coherence,
-            structural_balance, shape_diversity, angular_features, geometric_harmony
-        ]);
-
-        // Ensure we have exactly 32 shape features
-        shape_features.resize(32, 0.0);
-        shape_features
-    }
-
     fn rate_current_image(&mut self, rating: u8) -> Result<()> {
-        if let Some(image) = &self.loaded_images[2] {
+        if let Some(image) = self.loaded_images.get(&self.current_index) {
             let hash = self.compute_image_hash(image);
             let features = if let Some(cached) = self.image_features_cache.get(&hash) {
                 cached.clone()
             } else {
-                let features = self.extract_features(image);
+                let features = Self::extract_features_static(image, &self.onnx_session);
                 self.image_features_cache.insert(hash.clone(), features.clone());
                 features
             };
@@ -1592,16 +1371,7 @@ impl ImageViewer {
                 }
             }
 
-            // Flash effect for rating
-            self.flash_state = 1.0;
-            self.flash_color = match rating {
-                1 => egui::Color32::from_rgb(255, 100, 100), // Red
-                2 => egui::Color32::from_rgb(255, 165, 0),   // Orange
-                3 => egui::Color32::from_rgb(255, 255, 100), // Yellow
-                4 => egui::Color32::from_rgb(144, 238, 144), // Light green
-                5 => egui::Color32::from_rgb(100, 255, 100), // Green
-                _ => egui::Color32::WHITE,
-            };
+            // Flash animation will be set after advancing to next image
         }
 
         Ok(())
@@ -1611,7 +1381,7 @@ impl ImageViewer {
         // Process any completed background work first
         self.process_background_results();
 
-        if let Some(image) = &self.loaded_images[2] {
+        if let Some(image) = self.loaded_images.get(&self.current_index) {
             let hash = self.compute_image_hash(image);
 
             // Check if we already have a rating for this image
@@ -1641,25 +1411,35 @@ impl ImageViewer {
                     self.current_rating = None;
                 }
             } else {
-                // No cached features, start background extraction if not already pending
-                if !self.pending_suggestions.contains_key(&hash) {
-                    self.pending_suggestions.insert(hash.clone(), true);
-                    let hash_clone = hash.clone();
-                    if let Err(e) = self.feature_extraction_tx.send((hash_clone, image.clone())) {
-                        eprintln!("Failed to send image for feature extraction: {}", e);
-                        self.pending_suggestions.remove(&hash);
-                    }
-                }
+                // Extract features synchronously for immediate use
+                let features = Self::extract_features_static(image, &self.onnx_session);
+                self.image_features_cache.insert(hash.clone(), features.clone());
 
-                // Clear current state while processing
-                self.suggested_rating = None;
-                self.current_rating = None;
+                // Predict immediately if we have a predictor
+                if let Some(predictor) = &self.predictor {
+                    match predictor.predict(&features) {
+                        Ok(prediction) => {
+                            self.suggested_rating = Some(prediction);
+                            self.current_rating = None;
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to predict rating: {}", e);
+                            self.suggested_rating = None;
+                            self.current_rating = None;
+                        }
+                    }
+                } else {
+                    self.suggested_rating = None;
+                    self.current_rating = None;
+                }
             }
         }
     }
 
     fn process_background_results(&mut self) {
-        // Process completed feature extractions
+        // Simplified - only process prediction results from background thread
+
+        // Process completed feature extractions (legacy support)
         while let Ok((hash, features)) = self.feature_extraction_rx.try_recv() {
             self.image_features_cache.insert(hash.clone(), features.clone());
             self.pending_suggestions.remove(&hash);
@@ -1675,7 +1455,7 @@ impl ImageViewer {
         // Process completed predictions
         while let Ok((hash, prediction)) = self.prediction_rx.try_recv() {
             // Check if this prediction is for the current image
-            if let Some(current_image) = &self.loaded_images[2] {
+            if let Some(current_image) = self.loaded_images.get(&self.current_index) {
                 let current_hash = self.compute_image_hash(current_image);
                 if hash == current_hash {
                     // Check if we don't already have a rating for this image
@@ -1686,66 +1466,107 @@ impl ImageViewer {
                 }
             }
         }
-
-        // Preemptively extract features for nearby images
-        self.preextract_nearby_features();
     }
 
+    #[allow(dead_code)]
     fn preextract_nearby_features(&mut self) {
-        // Extract features for next 2 images if they're loaded and not already cached/pending
-        for i in 3..5 { // indices 3 and 4 are the next 2 images
-            if let Some(image) = &self.loaded_images[i] {
-                let hash = self.compute_image_hash(image);
-
-                // Only start extraction if not already cached or pending
-                if !self.image_features_cache.contains_key(&hash) &&
-                   !self.pending_suggestions.contains_key(&hash) {
-                    self.pending_suggestions.insert(hash.clone(), true);
-                    if let Err(_) = self.feature_extraction_tx.send((hash.clone(), image.clone())) {
-                        self.pending_suggestions.remove(&hash);
-                    }
-                }
+        // Simplified - extract features for loaded images that don't have them yet
+        for (&_index, image) in &self.loaded_images {
+            let hash = self.compute_image_hash(image);
+            if !self.image_features_cache.contains_key(&hash) &&
+               !self.pending_suggestions.contains_key(&hash) {
+                // Extract features synchronously for better reliability
+                let features = Self::extract_features_static(image, &self.onnx_session);
+                self.image_features_cache.insert(hash, features);
             }
         }
+    }
+
+    #[allow(dead_code)]
+    fn should_defer_heavy_operations(&self) -> bool {
+        // Defer heavy operations if we're processing too frequently (likely window movement)
+        let now = Instant::now();
+        let _should_repaint = now.duration_since(self.last_repaint_request) > Duration::from_millis(16); // ~60 FPS max
+        false
     }
 }
 
 impl eframe::App for ImageViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Update window title with current filename
-        if let Some(current_path) = self.images.get(self.current_index) {
-            if let Some(filename) = current_path.file_name() {
-                if let Some(filename_str) = filename.to_str() {
-                    ctx.send_viewport_cmd(ViewportCommand::Title(format!("{} | IV", filename_str)));
+        // Optimize repaint frequency and reduce work when window is being dragged
+        let now = Instant::now();
+        let _should_repaint = now.duration_since(self.last_repaint_request) > Duration::from_millis(16); // ~60 FPS max
+
+        // Detect if window is being interacted with (moved/resized) by checking if we're getting rapid updates
+        let is_window_interaction = now.duration_since(self.last_repaint_request) < Duration::from_millis(8);
+
+        // Reduce background processing during window interactions
+        let should_process_background = !is_window_interaction &&
+            now.duration_since(self.last_background_check) > Duration::from_millis(33); // 30fps for background work
+
+        // Update window title only when needed
+        if !is_window_interaction {
+            if let Some(current_path) = self.images.get(self.current_index) {
+                if let Some(filename) = current_path.file_name() {
+                    if let Some(filename_str) = filename.to_str() {
+                        ctx.send_viewport_cmd(ViewportCommand::Title(format!("{} | IV", filename_str)));
+                    }
                 }
             }
         }
 
-        self.update_loaded_images();
-
-        // Update flash animation
-        if self.flash_state > 0.0 {
-            self.flash_state = (self.flash_state - 0.05).max(0.0);
-            ctx.request_repaint();
+        // Only update loaded images if not dragging window
+        if !is_window_interaction {
+            self.update_loaded_images();
         }
 
-        // Update rating suggestions when images are loaded
-        self.update_suggestion();
+        // Update flash animation - always update when active
+        let flash_intensity = if self.flash_animation.is_active() {
+            let intensity = self.flash_animation.update();
+            // Always repaint during flash animations for visibility
+            if intensity > 0.0 {
+                ctx.request_repaint();
+                self.dirty_state = true;
+            } else {
+                // Flash just finished, clean up texture cache
+                self.texture_cache.clear();
+            }
+            intensity
+        } else {
+            0.0
+        };
 
-        // Process background results to keep UI responsive
-        self.process_background_results();
+        // Update rating suggestions when images are loaded - throttle during window movement
+        if should_process_background {
+            self.update_suggestion();
+            self.last_background_check = now;
+        }
 
-        // Request continuous updates to catch keyboard events
-        ctx.request_repaint();
+        // Process background results less frequently during window interactions
+        if should_process_background {
+            self.process_background_results();
+        }
+
+        // Handle auto-advance after rating (wait for flash to be visible)
+        // Commented out auto-advance logic - now advance immediately during rating
+        // if let Some(advance_time) = self.auto_advance_time {
+        //     if now.duration_since(advance_time) > Duration::from_millis(250) { // Wait 250ms to see flash
+        //         let _ = self.next_image();
+        //         self.auto_advance_time = None;
+        //         needs_immediate_repaint = true;
+        //     }
+        // }
 
         // Handle keyboard input
+        let mut needs_immediate_repaint = false;
+
         if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
             let _ = self.next_image();
-            ctx.request_repaint();
+            needs_immediate_repaint = true;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
             let _ = self.previous_image();
-            ctx.request_repaint();
+            needs_immediate_repaint = true;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -1754,13 +1575,13 @@ impl eframe::App for ImageViewer {
             if let Err(e) = self.copy_to_favorites() {
                 eprintln!("Failed to copy image to favorites: {}", e);
             }
-            ctx.request_repaint();
+            needs_immediate_repaint = true;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
             if let Err(e) = self.move_to_deleted() {
                 eprintln!("Failed to move image to deleted folder: {}", e);
             }
-            ctx.request_repaint();
+            needs_immediate_repaint = true;
         }
 
         // Handle rating input (number keys 1-5)
@@ -1775,49 +1596,40 @@ impl eframe::App for ImageViewer {
                 if let Err(e) = self.rate_current_image(rating) {
                     eprintln!("Failed to rate image: {}", e);
                 } else {
-                    // Automatically advance to next image after rating
+                    // Advance to next image first
                     let _ = self.next_image();
+
+                    // Then set flash animation to play on the advanced image
+                    self.flash_animation = FlashAnimation::new(match rating {
+                        1 => egui::Color32::from_rgb(255, 100, 100), // Red
+                        2 => egui::Color32::from_rgb(255, 165, 0),   // Orange
+                        3 => egui::Color32::from_rgb(255, 255, 100), // Yellow
+                        4 => egui::Color32::from_rgb(144, 238, 144), // Light green
+                        5 => egui::Color32::from_rgb(100, 255, 100), // Green
+                        _ => egui::Color32::WHITE,
+                    });
+
+                    ctx.request_repaint();
+                    needs_immediate_repaint = true;
                 }
-                ctx.request_repaint();
             }
         }
 
         // Debug feature extraction (press D key)
         if ctx.input(|i| i.key_pressed(egui::Key::D)) {
-            if let Some(image) = &self.loaded_images[2] {
-                let features = self.extract_features(image);
+            if let Some(image) = self.loaded_images.get(&self.current_index) {
+                let features = Self::extract_features_static(image, &self.onnx_session);
                 println!("\n=== DEBUG: Feature Analysis ===");
                 println!("Image size: {}x{}", image.width(), image.height());
+                println!("Feature vector size: {} (ResNet-50 output)", features.len());
 
-                // Color and brightness features
-                println!("Brightness (mean): {:.3}", features[96]); // First brightness feature
-                println!("Contrast (RMS): {:.3}", features[99]); // RMS contrast
-                println!("Average saturation: {:.3}", features[120]); // Saturation
-
-                // Edge and texture features
-                println!("Edge density: {:.3}", features[104]); // Edge density
-                println!("Strong edge ratio: {:.3}", features[105]); // Strong edges
-                println!("Noise level: {:.3}", features[136]); // Noise
-
-                // Composition features
-                println!("Center-edge brightness diff: {:.3}", features[152]); // Composition
-                println!("Aspect ratio: {:.3}", features[153]); // Aspect ratio
-                println!("Resolution score: {:.3}", features[154]); // Resolution
-
-                // New shape features (starting at index 156)
-                println!("\n--- Shape Analysis ---");
-                println!("Corner density: {:.3}", features[156]); // Corner density
-                println!("Horizontal lines: {:.3}", features[160]); // Horizontal line density
-                println!("Vertical lines: {:.3}", features[161]); // Vertical line density
-                println!("Line regularity: {:.3}", features[167]); // Line regularity
-                println!("Horizontal symmetry: {:.3}", features[168]); // Horizontal symmetry
-                println!("Vertical symmetry: {:.3}", features[169]); // Vertical symmetry
-                println!("Overall symmetry: {:.3}", features[172]); // Overall symmetry
-                println!("Circle score: {:.3}", features[176]); // Circle detection
-                println!("Rectangle score: {:.3}", features[177]); // Rectangle detection
-                println!("Geometric regularity: {:.3}", features[181]); // Geometric regularity
-                println!("Organic vs geometric: {:.3}", features[182]); // Organic vs geometric
-                println!("Geometric harmony: {:.3}", features[187]); // Geometric harmony
+                // Show first few features for debugging
+                if features.len() >= 10 {
+                    println!("First 10 features: {:?}", &features[0..10]);
+                }
+                if features.len() >= 100 {
+                    println!("Features 90-100: {:?}", &features[90..100]);
+                }
 
                 if let Some(predictor) = &self.predictor {
                     match predictor.predict(&features) {
@@ -1834,14 +1646,35 @@ impl eframe::App for ImageViewer {
             }
         }
 
+        // Test simplified processing (press T key)
+        if ctx.input(|i| i.key_pressed(egui::Key::T)) {
+            println!("Image processing is now synchronous for better stability:");
+            println!("- Images load immediately when navigating");
+            println!("- Features extract synchronously for instant AI predictions");
+            println!("- Texture cache manages memory efficiently");
+            println!("- No more race conditions or out-of-order issues");
+        }
+
         // Handle mouse input
         if ctx.input(|i| i.pointer.primary_clicked()) {
             let _ = self.next_image();
-            ctx.request_repaint();
+            needs_immediate_repaint = true;
         }
         if ctx.input(|i| i.pointer.secondary_clicked()) {
             let _ = self.previous_image();
+            needs_immediate_repaint = true;
+        }
+
+        // Only request repaint when necessary - always repaint during flash animations
+        if needs_immediate_repaint || self.flash_animation.is_active() {
+            self.dirty_state = true;
+        }
+
+        // Always request repaint if we have dirty state (removed window interaction check for flash)
+        if self.dirty_state {
             ctx.request_repaint();
+            self.last_repaint_request = now;
+            self.dirty_state = false;
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1874,7 +1707,7 @@ impl eframe::App for ImageViewer {
 
                 ui.separator();
 
-                // Show GPU acceleration status
+                // Show GPU acceleration status and performance info
                 if let Some(ref predictor) = self.predictor {
                     let performance_info = predictor.get_performance_info();
                     let color = if performance_info.contains("GPU") {
@@ -1884,22 +1717,28 @@ impl eframe::App for ImageViewer {
                     };
                     ui.colored_label(color, performance_info);
                 }
+
+                // Show texture cache usage
+                let memory_usage = self.texture_cache.get_memory_usage_mb();
+                let memory_color = if memory_usage > 400.0 {
+                    egui::Color32::from_rgb(255, 100, 100) // Red for high usage
+                } else if memory_usage > 200.0 {
+                    egui::Color32::from_rgb(255, 255, 100) // Yellow for medium usage
+                } else {
+                    egui::Color32::from_rgb(100, 255, 100) // Green for low usage
+                };
+                ui.colored_label(memory_color, format!("Cache: {:.1}MB", memory_usage));
             });
 
             ui.separator();
 
-            if let Some(img) = &self.loaded_images[2] {
+            if let Some(img) = self.loaded_images.get(&self.current_index) {
                 let size = [img.width() as f32, img.height() as f32];
-                let texture = self.image_textures[2].get_or_insert_with(|| {
-                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                        [img.width() as usize, img.height() as usize],
-                        &img.to_rgba8().into_raw(),
-                    );
-                    ui.ctx().load_texture(
-                        "current_image",
-                        color_image,
-                        egui::TextureOptions::default(),
-                    )
+
+                // Use optimized texture cache with better key
+                let texture_key = format!("image_{}_{}", self.current_index, img.width() * img.height());
+                let texture = self.texture_cache.get_or_create_optimized(texture_key, ctx, || {
+                    img.clone()
                 });
 
                 let available_size = ui.available_size();
@@ -1907,26 +1746,23 @@ impl eframe::App for ImageViewer {
                 let scaled_size = egui::vec2(size[0] * scale, size[1] * scale);
 
                 let response = ui.centered_and_justified(|ui| {
-                    let response = ui.add(egui::Image::new((texture.id(), scaled_size))
-                        .sense(egui::Sense::click_and_drag()));
+                    let mut image_widget = egui::Image::new((texture.id(), scaled_size))
+                        .sense(egui::Sense::click_and_drag());
 
-                    // Draw flash overlay if active
-                    if self.flash_state > 0.0 {
-                        let rect = response.rect;
-                        let alpha = (self.flash_state * 0.5 * 255.0) as u8;
-                        let flash_color = match self.flash_color {
-                            egui::Color32::WHITE => egui::Color32::from_white_alpha(alpha),
-                            egui::Color32::RED => egui::Color32::from_rgba_premultiplied(255, 0, 0, alpha),
-                            _ => egui::Color32::from_white_alpha(alpha),
+                    // Apply flash effect with much stronger visibility
+                    if flash_intensity > 0.0 {
+                        let flash_tint = match self.flash_animation.color {
+                            egui::Color32::WHITE => egui::Color32::from_rgba_premultiplied(255, 255, 255, (flash_intensity * 200.0) as u8),
+                            egui::Color32::RED => egui::Color32::from_rgba_premultiplied(255, 100, 100, (flash_intensity * 180.0) as u8),
+                            color => {
+                                let [r, g, b, _] = color.to_array();
+                                egui::Color32::from_rgba_premultiplied(r, g, b, (flash_intensity * 200.0) as u8)
+                            }
                         };
-                        ui.painter().rect_filled(
-                            rect,
-                            0.0,
-                            flash_color,
-                        );
+                        image_widget = image_widget.tint(flash_tint);
                     }
 
-                    response
+                    ui.add(image_widget)
                 });
 
                 if response.inner.clicked() {
@@ -1972,14 +1808,35 @@ fn main() -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
-            .with_inner_size([800.0, 600.0]),
+            .with_inner_size([800.0, 600.0])
+            .with_min_inner_size([600.0, 400.0]) // Minimum size for usability
+            .with_resizable(true),
+        vsync: true, // Enable vsync for smoother rendering
+        multisampling: 4, // Enable 4x MSAA for better quality
+        depth_buffer: 0, // We don't need depth buffer for 2D images
+        stencil_buffer: 0, // We don't need stencil buffer
+        hardware_acceleration: eframe::HardwareAcceleration::Required, // Force GPU acceleration
         ..Default::default()
     };
 
     eframe::run_native(
-        "Image Viewer",
+        "Image Viewer - GPU Accelerated",
         options,
-        Box::new(|_cc| Ok(Box::new(viewer))),
+        Box::new(|cc| {
+            // Configure egui for better performance
+            cc.egui_ctx.set_visuals(egui::Visuals {
+                window_corner_radius: CornerRadius::same(5),
+                ..egui::Visuals::dark()
+            });
+
+            // Set texture allocation options for better GPU performance
+            cc.egui_ctx.set_style(egui::Style {
+                animation_time: 0.1, // Faster animations
+                ..egui::Style::default()
+            });
+
+            Ok(Box::new(viewer))
+        }),
     ).map_err(|e| anyhow::anyhow!("Failed to run application: {}", e))?;
     Ok(())
 }
